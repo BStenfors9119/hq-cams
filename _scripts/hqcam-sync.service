@@ -1,0 +1,13 @@
+[Unit]
+Description=hqcam footage sync to HQ storage (rsync when back on HQ)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hqcam-sync auto
+# A large first backlog can take a while over WiFi. If this timeout is hit the
+# run is killed, but --partial keeps progress and source files are removed only
+# once fully transferred, so the next run simply resumes — no footage is lost.
+TimeoutStartSec=3600
+# Triggered at boot and periodically by hqcam-sync.timer.

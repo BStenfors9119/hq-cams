@@ -1,0 +1,13 @@
+[Unit]
+Description=Re-evaluate hqcam WiFi fallback hotspot
+
+[Timer]
+# Decide shortly after boot, then re-check so a later HQ-WiFi dropout still
+# falls back to the AP. Re-checks are cheap and non-disruptive when already
+# connected or already broadcasting.
+OnBootSec=20
+OnUnitActiveSec=2min
+Unit=hqcam-hotspot.service
+
+[Install]
+WantedBy=timers.target

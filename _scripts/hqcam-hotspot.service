@@ -1,0 +1,15 @@
+[Unit]
+Description=hqcam WiFi fallback hotspot (join HQ WiFi, else broadcast AP)
+Wants=NetworkManager.service
+After=NetworkManager.service
+# Only meaningful once NetworkManager owns wlan0.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hqcam-hotspot auto
+# The decision run can block for up to AP_GRACE seconds (default 90) waiting for
+# a known network, which exceeds systemd's default 90s start timeout — raise it
+# so a full-grace run isn't killed mid-decision. Bump this if you raise AP_GRACE.
+TimeoutStartSec=180
+# Triggered at boot and periodically by hqcam-hotspot.timer. `auto` re-checks a
+# running AP but only interrupts it for a brief, guarded periodic HQ-rejoin.

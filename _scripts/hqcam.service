@@ -1,0 +1,22 @@
+[Unit]
+Description=HQ CSI camera MJPEG stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hqcam
+Restart=always
+RestartSec=2
+Environment=RUST_LOG=info
+# Optional offline-recorder tuning (HQCAM_RECORD_DIR, HQCAM_SEGMENT_SECS, …).
+# The leading `-` makes it optional, so absence of the file is not an error.
+EnvironmentFile=-/usr/local/etc/hqcam/record.conf
+# Runs as root so it can reach the camera/video devices without extra setup.
+# To run unprivileged instead, set `User=` to an account in the `video` group.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hqcam
+
+[Install]
+WantedBy=multi-user.target

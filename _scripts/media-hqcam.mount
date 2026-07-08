@@ -1,0 +1,22 @@
+# Mounts the USB footage drive for the hqcam offline recorder.
+#
+# Label a USB drive HQCAM (e.g. `sudo e2label /dev/sda1 HQCAM` for ext4, or
+# `sudo fatlabel /dev/sda1 HQCAM` for FAT) and it mounts here at boot. The unit
+# filename MUST match the mount path: media-hqcam.mount -> /media/hqcam.
+#
+# Best-effort by design: if no HQCAM-labelled drive is present the mount just
+# fails, and the recorder skips saving — it never falls back to the SD card.
+#
+# Enable with: sudo systemctl enable --now media-hqcam.mount
+
+[Unit]
+Description=hqcam USB footage drive
+
+[Mount]
+What=/dev/disk/by-label/HQCAM
+Where=/media/hqcam
+Type=auto
+Options=noatime,nofail
+
+[Install]
+WantedBy=multi-user.target

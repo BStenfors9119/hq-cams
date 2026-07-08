@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically sync hqcam footage to HQ storage
+
+[Timer]
+# Shortly after boot, then every few minutes. Each run is a cheap no-op unless
+# footage is present and HQ storage is reachable, so frequent checks are fine.
+OnBootSec=45
+OnUnitActiveSec=5min
+Unit=hqcam-sync.service
+
+[Install]
+WantedBy=timers.target
