@@ -71,6 +71,11 @@ if echo "$BUMP_TYPE" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 echo "New version: $NEW_VERSION"
 sed -i "s/^Version: .*/Version: $NEW_VERSION/" "$CONTROL_FILE"
+# Stamp the same version into the crate, so the binary reports it
+# (CARGO_PKG_VERSION -> /api/status "version"). Only the [package] version —
+# the first `version =` line in Cargo.toml. Cargo updates Cargo.lock to match.
+sed -i "0,/^version = /s/^version = .*/version = \"$NEW_VERSION\"/" ../Cargo.toml
+grep -q "^version = \"$NEW_VERSION\"" ../Cargo.toml || { echo "Error: couldn't stamp $NEW_VERSION into Cargo.toml"; exit 1; }
 
 for arch in "${archs[@]}"; do
   # Only arches requested this run are built and packaged.

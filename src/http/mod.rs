@@ -37,8 +37,8 @@ use serde_json::Value;
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
 use crate::cam::{self, CamControl, Capture, FrameBus, MjpegStream, Orientation};
-use crate::conf;
 use crate::recorder::{self, Recorder, RecorderStatus};
+use crate::settings::{self, OrientationChange};
 use crate::snapshot::{Snapshot, SnapshotError, Snapshots, Storage};
 use crate::status::{self, Health};
 
@@ -332,21 +332,11 @@ fn post_orientation(request: &mut Request, cam: &CamControl) -> Reply {
         Ok(b) => b,
         Err(reply) => return reply,
     };
-    let mut o = cam.get();
-    if let Some(r) = body.rotation {
-        if !matches!(r, 0 | 90 | 180 | 270) {
-            return error(400, "rotation must be 0, 90, 180 or 270");
-        }
-        o.rotation = r;
+    let change = OrientationChange { rotation: body.rotation, hflip: body.hflip, vflip: body.vflip };
+    match settings::set_orientation(cam, change) {
+        Ok(o) => json(200, &OrientationJson::from(o)),
+        Err(e) => error(400, e),
     }
-    o.hflip = body.hflip.unwrap_or(o.hflip);
-    o.vflip = body.vflip.unwrap_or(o.vflip);
-    cam.set(o);
-    log::info!("orientation set via API: {o:?}");
-    let flag = |b: bool| if b { "1" } else { "0" };
-    let rotation = o.rotation.to_string();
-    save(&[("HQCAM_ROTATION", &rotation), ("HQCAM_HFLIP", flag(o.hflip)), ("HQCAM_VFLIP", flag(o.vflip))]);
-    json(200, &OrientationJson::from(o))
 }
 
 /// `GET|POST /orientation?rotation=&hflip=&vflip=` — the original query-string
@@ -398,30 +388,10 @@ fn post_focus(request: &mut Request, cam: &CamControl) -> Reply {
         Ok(b) => b,
         Err(reply) => return reply,
     };
-    let lens = match &body.lens_position {
-        Value::Null => None,
-        Value::Number(n) => Some(n.to_string()),
-        Value::String(s) => Some(s.clone()),
-        _ => return error(400, "lensPosition must be null (autofocus), a number, or \"default\""),
-    };
-    let lens = match lens {
-        None => None,
-        Some(raw) => match cam::parse_lens_position(&raw) {
-            Some(p) => Some(p),
-            None => return error(400, "lensPosition must be 0–32 (dioptres: 0 = infinity) or \"default\""),
-        },
-    };
-    cam.set_focus(lens.clone());
-    log::info!("focus set via API: {}", lens.as_deref().unwrap_or("auto"));
-    save(&[("HQCAM_LENS_POSITION", lens.as_deref().unwrap_or(""))]);
-    json(200, &FocusJson::from(lens))
-}
-
-/// Save settings to record.conf. A failure is logged, not returned: the change
-/// is already live, it just won't survive a restart.
-fn save(pairs: &[(&str, &str)]) {
-    let path = conf::path();
-    if let Err(e) = conf::set(&path, pairs) {
-        log::error!("couldn't save settings to {}: {e} (applied until restart)", path.display());
+    match settings::lens_from_json(&body.lens_position)
+        .and_then(|lens| settings::set_focus(cam, lens.as_deref()))
+    {
+        Ok(lens) => json(200, &FocusJson::from(lens)),
+        Err(e) => error(400, e),
     }
 }

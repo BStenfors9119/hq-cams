@@ -3,6 +3,7 @@ mod conf;
 mod http;
 mod recorder;
 mod rotate;
+mod settings;
 mod snapshot;
 mod status;
 
