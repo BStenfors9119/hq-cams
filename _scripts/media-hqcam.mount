@@ -5,9 +5,17 @@
 # filename MUST match the mount path: media-hqcam.mount -> /media/hqcam.
 #
 # Best-effort by design: if no HQCAM-labelled drive is present the mount just
-# fails, and the recorder skips saving — it never falls back to the SD card.
+# doesn't run, and the recorder skips saving — it never falls back to the SD card.
 #
-# Enable with: sudo systemctl enable --now media-hqcam.mount
+# Triggered by the DEVICE, not by a boot target: [Install] WantedBy= names the
+# udev device unit for the HQCAM label, so `systemctl enable` wires the mount to
+# start only when that drive actually appears (at boot or hot-plug). Wanting it
+# from multi-user.target instead makes every diskless boot try to mount a device
+# that isn't there, whose device-unit job then fails with the misleading
+# "A dependency job for media-hqcam.mount failed" — even with nofail. Keying it
+# to the device makes an absent drive a silent no-op, which is the intent.
+#
+# Enable with: sudo systemctl enable media-hqcam.mount   (starts on plug)
 
 [Unit]
 Description=hqcam USB footage drive
@@ -19,4 +27,6 @@ Type=auto
 Options=noatime,nofail
 
 [Install]
-WantedBy=multi-user.target
+# The udev device unit for /dev/disk/by-label/HQCAM (systemd-escaped). When the
+# labelled drive is present, this device activates and pulls in the mount.
+WantedBy=dev-disk-by\x2dlabel-HQCAM.device

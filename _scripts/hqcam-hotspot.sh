@@ -5,8 +5,11 @@
 # at home); otherwise broadcast our own access point so the cam is reachable in
 # the vehicle at http://10.42.0.1:6877.
 #
-# A Pi has a single WiFi radio, so it is EITHER a client OR an AP — never both.
-# This script decides which, based on whether a known network is reachable.
+# With only the onboard radio a Pi is EITHER a client OR an AP — never both — and
+# this script decides which, based on whether a known network is reachable. In a
+# dual-radio setup (a 5 GHz USB dongle for the HQ client link + the onboard radio
+# hosting the AP) both can run at once: client detection is radio-agnostic (any
+# interface but our AP), while the AP always binds IFACE (the onboard radio).
 #
 # NetworkManager only (Raspberry Pi OS Bookworm / Trixie). NM's `ipv4.method
 # shared` gives the AP its own DHCP + DNS on 10.42.0.0/24 (gateway 10.42.0.1) —
@@ -44,18 +47,24 @@ ap_has_clients() {
   iw dev "$IFACE" station dump 2>/dev/null | grep -q "^Station"
 }
 
-# Name of the wifi connection currently active on our interface, if any.
-active_wifi_name() {
+# Name of an active CLIENT wifi connection — on ANY interface, excluding our own
+# AP. Radio-agnostic on purpose: in a dual-radio setup (a 5 GHz USB dongle for
+# the HQ link + the onboard radio hosting the AP) the client link is on a
+# different interface (e.g. wlan5g) than IFACE. Pinning this to IFACE would read
+# "offline" while the dongle is happily connected, and wrongly raise the AP.
+client_wifi_name() {
+  nmcli -t -f NAME,TYPE connection show --active \
+    | awk -F: -v ap="$AP_CON" '$2=="802-11-wireless" && $1!=ap {print $1; exit}'
+}
+
+client_connected() { [ -n "$(client_wifi_name)" ]; }
+
+# Is OUR AP connection active on the AP interface?
+ap_active() {
   nmcli -t -f NAME,DEVICE,TYPE connection show --active \
-    | awk -F: -v d="$IFACE" '$3=="802-11-wireless" && $2==d {print $1}'
+    | awk -F: -v ap="$AP_CON" -v d="$IFACE" \
+        '$3=="802-11-wireless" && $1==ap && $2==d {found=1} END{exit(found?0:1)}'
 }
-
-client_connected() {
-  local n; n="$(active_wifi_name)"
-  [ -n "$n" ] && [ "$n" != "$AP_CON" ]
-}
-
-ap_active() { [ "$(active_wifi_name)" = "$AP_CON" ]; }
 
 # Create the AP profile if missing, or refresh its SSID/password from config.
 # Kept in sync every run so editing hotspot.conf + a restart is enough.
@@ -91,7 +100,7 @@ attempt_rejoin() {
   for _ in $(seq 1 "$REJOIN_GRACE"); do
     sleep 1
     if client_connected; then
-      log "rejoined HQ WiFi '$(active_wifi_name)' — leaving AP down"
+      log "rejoined HQ WiFi '$(client_wifi_name)' — leaving AP down"
       return 0
     fi
   done
@@ -111,7 +120,7 @@ auto() {
   ensure_ap_profile
 
   if client_connected; then
-    log "on WiFi '$(active_wifi_name)' — AP not needed"
+    log "on WiFi '$(client_wifi_name)' — AP not needed"
     exit 0
   fi
 
@@ -138,7 +147,7 @@ auto() {
   for _ in $(seq 1 "$GRACE"); do
     sleep 1
     if client_connected; then
-      log "joined '$(active_wifi_name)'"
+      log "joined '$(client_wifi_name)'"
       exit 0
     fi
   done
@@ -153,7 +162,7 @@ case "${1:-auto}" in
   off)    ap_down ;;
   status)
     if client_connected; then
-      echo "client: $(active_wifi_name)"
+      echo "client: $(client_wifi_name)"
     elif ap_active; then
       echo "ap: $AP_SSID (http://10.42.0.1:6877)"
     else

@@ -38,6 +38,15 @@ cp ./_scripts/hqcam-hotspot.sh $PKG_SUPPORTING_BIN_FILES_PATH/hqcam-hotspot
 # Footage-sync script → /usr/local/bin/hqcam-sync.
 cp ./_scripts/hqcam-sync.sh $PKG_SUPPORTING_BIN_FILES_PATH/hqcam-sync
 
+# 5 GHz USB dongle diagnostic → /usr/local/bin/hqcam-verify-dongle. Read-only;
+# run on the Pi to check a dongle's chipset/driver/5 GHz/AP-mode support.
+cp ./_scripts/verify-dongle.sh $PKG_SUPPORTING_BIN_FILES_PATH/hqcam-verify-dongle
+
+# Dual-radio setup → /usr/local/bin/hqcam-dual-radio. Run on the Pi to use a
+# 5 GHz USB dongle for the HQ client link while keeping the onboard radio as the
+# fallback-AP host (pins the dongle name, binds hqcam-wifi to it, edits confs).
+cp ./_scripts/hqcam-dual-radio.sh $PKG_SUPPORTING_BIN_FILES_PATH/hqcam-dual-radio
+
 # Hotspot config ships as a .default; postinst copies it into place only when no
 # hotspot.conf exists yet, so a device's edited SSID/password survives upgrades.
 mkdir -p $PKG_SUPPORTING_ETC_FILES_PATH

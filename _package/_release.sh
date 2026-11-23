@@ -7,7 +7,7 @@
 # aws-lc-rs, which hqcam does not depend on — it's pure Rust).
 #
 # Usage:
-#   ./_release.sh <major|minor|patch> <deploy true|false> <amd64|armhf|all> <rc true|false> [APT_SERVER_IP]
+#   ./_release.sh <major|minor|patch> <deploy true|false> <arm64|armhf|all> <rc true|false> [APT_SERVER_IP]
 BUMP_TYPE=$1
 DEPLOY=$2
 BUILD_ARCH=$3
@@ -30,9 +30,10 @@ fi
 bash ./copy-supporting-files.sh $RC
 
 CONTROL_FILE="hqcam/DEBIAN/control"
-## arch list. TSR ships arm64+armhf; cameras ship amd64+armhf. Add arm64
-## (aarch64-unknown-linux-gnu) or armv6 here + in the triple case below.
-declare -a archs=( "amd64" "armhf" )
+## arch list. Cameras run on Pis only: arm64 (Zero 2 W / Pi 3+) + armhf (Zero W /
+## original). amd64 was dead weight — a Pi never runs it — so it's dropped. Add
+## armv6 (arm-unknown-linux-gnueabi) here + in the triple case below if needed.
+declare -a archs=( "arm64" "armhf" )
 ## Pi OS glibc versions: Stretch 2.24, Buster 2.28, Bullseye 2.31, Bookworm 2.36.
 declare -a ldds=( "2.24" "2.28" "2.31" "2.36" "2.41" )
 
@@ -70,8 +71,8 @@ for arch in "${archs[@]}"; do
   for ldd in "${ldds[@]}"; do
     sed -i "s/^Architecture: .*/Architecture: $arch/" "$CONTROL_FILE"
 
-    if [[ "$arch" == "amd64" && ( "$BUILD_ARCH" == "amd64" || "$BUILD_ARCH" == "all" ) ]]; then
-      TRIPLE=x86_64-unknown-linux-gnu
+    if [[ "$arch" == "arm64" && ( "$BUILD_ARCH" == "arm64" || "$BUILD_ARCH" == "all" ) ]]; then
+      TRIPLE=aarch64-unknown-linux-gnu
     elif [[ "$arch" == "armhf" && ( "$BUILD_ARCH" == "armhf" || "$BUILD_ARCH" == "all" ) ]]; then
       TRIPLE=arm-unknown-linux-gnueabihf
     else

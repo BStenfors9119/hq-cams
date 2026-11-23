@@ -25,16 +25,30 @@ Package for the apt repo with [`cargo-deb`](https://github.com/kornelski/cargo-d
 
 Naming: the binary/crate/package and the systemd service are all **`hqcam`** (`SyslogIdentifier=hqcam`). Manual (non-deb) install uses `_scripts/install-hqcam-service.sh` / `uninstall-hqcam-service.sh`, which manage the `hqcam` unit.
 
-Tests are minimal: `cargo test` runs the motion-detector unit tests in `src/recorder/motion.rs` (the only module with meaningful pure logic). The rest is I/O plumbing exercised on-device.
+Tests are minimal: `cargo test` runs the motion-detector unit tests in `src/recorder/motion.rs` plus the capture-config / `rpicam-vid` argument tests in `src/cam/mod.rs`. The rest is I/O plumbing exercised on-device.
 
 ## Architecture (Rust)
 
 - **`src/cam/mod.rs`** is the camera + plumbing. `start()` spawns a supervised thread that runs `rpicam-vid --codec mjpeg -o -` and restarts it if it dies. Its stdout is split into JPEG frames by scanning for `SOI`/`EOI` markers (`FFD8`…`FFD9`), and each frame is published to a `FrameBus` — a single-slot, sequence-numbered broadcast (`Mutex` + `Condvar`) that is the Rust equivalent of the Python `StreamingOutput`/`threading.Condition`. `MjpegStream` is a `Read` adapter that wraps the `FrameBus` as an endless `multipart/x-mixed-replace` body.
-- **`src/main.rs`** is the HTTP layer (`tiny_http`, thread-per-request). Routes `/` → 301, `/index.html` → static `PAGE`, `/stream.mjpg` → a chunked `MjpegStream` response that runs until the client disconnects.
+- **`src/main.rs`** wires the pieces together and runs the `tiny_http` accept loop (thread-per-request); **`src/http/mod.rs`** routes each request (see "Web UI + JSON API"). `/stream.mjpg` is a chunked `MjpegStream` response that runs until the client disconnects.
 - **`src/recorder/mod.rs`** is a second `FrameBus` consumer (alongside `MjpegStream`) that saves footage to a USB drive while offline — see "USB footage recording" below.
-- Capture tuning (resolution, framerate, quality, `rpicam-vid` flags) lives in the `RPICAM_ARGS` constant in `cam/mod.rs`.
+- Capture size/rate/quality are env-configurable via `record.conf` (`HQCAM_WIDTH`, `HQCAM_HEIGHT`, `HQCAM_FRAMERATE`, `HQCAM_QUALITY`; `Capture` in `cam/mod.rs`, default 1296x972@15 q80 — sized for a Zero 2 W; a single-core Zero W needs ~640x480@10 q70). `HQCAM_TUNING_FILE` passes a libcamera tuning JSON (needed for NoIR modules, e.g. `imx219_noir.json`; missing file => ignored with a warning). `HQCAM_LENS_POSITION` (dioptres, `0` = infinity, or `default` = hyperfocal) locks focus on autofocus modules (Camera Module 3) via `--autofocus-mode manual --lens-position`; unset => rpicam-vid's own AF, invalid => ignored with a warning; leave unset on IMX219. Fixed `rpicam-vid` flags live in `RPICAM_BASE_ARGS`. Measured numbers are in the `Capture` doc comment.
+- **`src/rotate/mod.rs`** — `HQCAM_ROTATION` is clockwise 0|90|180|270. 0/180 + flips go to `rpicam-vid` (free); libcamera can't do quarter turns, so 90/270 are a lossless per-frame `tjTransform` from `libturbojpeg.so.0`, `dlopen`ed at runtime (no cross-link; deb dep `libturbojpeg0`). ~94 ms/frame on a Zero 2 W at 1640x1232 → caps ~10 fps. Missing lib => frames pass through unrotated + an error log.
+
+## Web UI + JSON API
+
+`src/http/mod.rs` serves the UI (`src/http/ui/` — plain HTML/CSS/JS, embedded with `include_str!`) and a JSON API on the same port. The full route list is the doc comment at the top of that file. **LAN only, no login.**
+
+- **Status** (`GET /api/status`): `src/status/` reads temp, `vcgencmd get_throttled` (decoded), load, memory, WiFi (`nmcli … --rescan no`, never forces a scan), plus camera/recorder/snapshot state. Unreadable sources are `null`.
+- **Snapshots** (`src/snapshot/`): "Take a Pic" saves the next live frame (no extra capture/encode; stream resolution) to `<HQCAM_SNAPSHOT_DIR>/YYYY-MM-DD/<n>.jpg`. Deliberate exception to "never the SD card": the default dir is `/var/lib/hqcam/snapshots`, capped at `HQCAM_SNAPSHOT_MAX_MB` (200) by pruning the oldest. Names are validated so requests can't escape the folder.
+- **Manual record** (`POST /api/record {"on":true}`): `Recorder::set_manual` in `src/recorder/`. Always continuous, works online or offline, still USB-only (409 with no drive). The recorder thread now always runs; `HQCAM_RECORD=0` only disables the *automatic* offline mode.
+- **Orientation / focus** (`POST /api/orientation`, `/api/focus`): applied live (capture restarts, ~1s blip) and **saved to `record.conf`** by `src/conf/` (replaces active `KEY=` lines, else uncomments the documented `#KEY=` line, else appends; atomic rename). The legacy `/orientation?…` query form still works but is in-memory only.
+
+Planned next: a cam → barbies-lab uplink (outbound only, device token) so pictures land on the HQ server and barbies-lab drives Take a Pic / live view; then VPN-based backup to the SodaPop network drive.
 
 ## WiFi fallback hotspot (vehicle access)
+
+> **DEACTIVATED (2026-11-20).** The AP was holding the radio and keeping cams from rejoining HQ WiFi. postinst no longer enables `hqcam-hotspot.timer`; it now disables/stops it and runs `hqcam-hotspot off` on upgrade. `firstrun.sh` no longer starts it. The script, units and config still ship, so it can be used by hand (`sudo hqcam-hotspot on|off|status`). To re-activate, restore the `enable`/`start` lines in postinst (they're left commented there). The rest of this section describes the design when it's active.
 
 So the cam is viewable from a phone/laptop while it's in the vehicle (no HQ WiFi around), the Pi runs a **fallback access point**. A Pi has a single WiFi radio, so it is either a client *or* an AP, never both — the logic picks one:
 

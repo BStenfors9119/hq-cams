@@ -21,6 +21,11 @@
 //!
 //! Everything is tunable via env vars (see [`Config`]), wired through the
 //! service's optional `EnvironmentFile` at `/usr/local/etc/hqcam/record.conf`.
+//!
+//! Besides the automatic offline mode there is a **manual** switch
+//! ([`Recorder::set_manual`], the web UI's Record button): it records
+//! continuously, online or not, until switched off. It obeys the same
+//! never-the-SD-card rule — no USB drive, no manual recording.
 
 mod motion;
 
@@ -31,12 +36,18 @@ use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 use crate::cam::FrameBus;
 use motion::{MotionDetector, MotionOpts};
+
+/// How often an idle recorder checks whether the manual switch was flipped.
+const MANUAL_POLL: Duration = Duration::from_millis(250);
 
 /// Capture frame rate — keep in sync with `--framerate` in `cam::RPICAM_ARGS`.
 /// Used only to size the motion pre-roll buffer in frames.
@@ -48,6 +59,9 @@ const PREROLL_MAX_BYTES: usize = 24 * 1024 * 1024;
 
 /// Recorder tunables, all overridable by environment variable.
 struct Config {
+    /// Automatic offline recording on (`HQCAM_RECORD`, default on). Manual
+    /// recording works either way.
+    auto: bool,
     /// USB mount to record onto. MUST be a real mountpoint or recording is
     /// skipped (we never write footage to the SD card).
     dir: PathBuf,
@@ -77,6 +91,7 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         Self {
+            auto: env_bool("HQCAM_RECORD", true),
             dir: env::var("HQCAM_RECORD_DIR")
                 .unwrap_or_else(|_| "/media/hqcam".into())
                 .into(),
@@ -113,47 +128,181 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-/// Spawn the recorder thread. Harmless to always start: it self-gates on being
-/// offline with a mounted drive, so on the HQ network it just idles.
-pub fn start(bus: Arc<FrameBus>) {
-    let cfg = Config::from_env();
-    let mode = if cfg.motion_gated { "motion-gated" } else { "continuous" };
-    log::info!(
-        "recorder: enabled ({mode}) — dir={}, segment={}s, keep-free={}MB (records only when off HQ WiFi with a USB drive mounted)",
-        cfg.dir.display(),
-        cfg.segment.as_secs(),
-        cfg.min_free_mb,
-    );
-    thread::spawn(move || run(bus, cfg));
+/// Shared handle to the recorder: the manual switch and what it's doing now.
+pub struct Recorder {
+    manual: AtomicBool,
+    auto: bool,
+    motion_gated: bool,
+    dir: PathBuf,
+    /// The file being written right now, if any.
+    current: Mutex<Option<PathBuf>>,
 }
 
-fn run(bus: Arc<FrameBus>, cfg: Config) {
+/// What the recorder is doing, as the API reports it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecorderStatus {
+    /// The manual Record switch.
+    pub manual: bool,
+    /// Automatic recording while off HQ WiFi (`HQCAM_RECORD`).
+    pub auto: bool,
+    /// `continuous` or `motion` — how automatic recording captures.
+    pub auto_mode: &'static str,
+    /// A file is being written right now.
+    pub recording: bool,
+    pub file: Option<String>,
+    pub dir: String,
+    pub drive_mounted: bool,
+    pub free_mb: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum RecordError {
+    /// Manual recording needs the USB drive; it never writes to the SD card.
+    NoDrive(PathBuf),
+}
+
+impl std::fmt::Display for RecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDrive(dir) => write!(f, "no USB drive is plugged in (looked at {})", dir.display()),
+        }
+    }
+}
+
+impl Recorder {
+    pub fn manual(&self) -> bool {
+        self.manual.load(Ordering::Relaxed)
+    }
+
+    /// Flip the manual Record switch. Turning it on needs the USB drive.
+    pub fn set_manual(&self, on: bool) -> Result<(), RecordError> {
+        if on && !mount_ready(&self.dir) {
+            return Err(RecordError::NoDrive(self.dir.clone()));
+        }
+        self.manual.store(on, Ordering::Relaxed);
+        log::info!("recorder: manual recording {}", if on { "on" } else { "off" });
+        Ok(())
+    }
+
+    pub fn status(&self) -> RecorderStatus {
+        let file = self.current.lock().unwrap().as_ref().map(|p| p.display().to_string());
+        let drive_mounted = mount_ready(&self.dir);
+        RecorderStatus {
+            manual: self.manual(),
+            auto: self.auto,
+            auto_mode: if self.motion_gated { "motion" } else { "continuous" },
+            recording: file.is_some(),
+            file,
+            dir: self.dir.display().to_string(),
+            drive_mounted,
+            free_mb: if drive_mounted { free_mb(&self.dir) } else { None },
+        }
+    }
+
+    fn set_current(&self, path: Option<PathBuf>) {
+        *self.current.lock().unwrap() = path;
+    }
+}
+
+/// Start the recorder thread and return its handle. Always started (the manual
+/// switch needs it); automatic offline recording self-gates on being offline
+/// with a mounted drive, and `HQCAM_RECORD=0` turns only that part off.
+pub fn start(bus: Arc<FrameBus>) -> Arc<Recorder> {
+    let cfg = Config::from_env();
+    let rec = Arc::new(Recorder {
+        manual: AtomicBool::new(false),
+        auto: cfg.auto,
+        motion_gated: cfg.motion_gated,
+        dir: cfg.dir.clone(),
+        current: Mutex::new(None),
+    });
+    if cfg.auto {
+        let mode = if cfg.motion_gated { "motion-gated" } else { "continuous" };
+        log::info!(
+            "recorder: automatic ({mode}) — dir={}, segment={}s, keep-free={}MB (records only when off HQ WiFi with a USB drive mounted)",
+            cfg.dir.display(),
+            cfg.segment.as_secs(),
+            cfg.min_free_mb,
+        );
+    } else {
+        log::info!("recorder: automatic recording disabled (HQCAM_RECORD=0); manual Record still works");
+    }
+    let handle = rec.clone();
+    thread::spawn(move || run(bus, cfg, handle));
+    rec
+}
+
+/// Sleep for up to `cfg.check`, waking early if the manual switch turns on.
+fn idle(cfg: &Config, rec: &Recorder) {
+    let start = Instant::now();
+    while start.elapsed() < cfg.check {
+        if rec.manual() {
+            return;
+        }
+        thread::sleep(MANUAL_POLL);
+    }
+}
+
+/// Whether to keep recording, re-checking the (slow, `nmcli`) offline test at
+/// most every `cfg.check`. Manual on => record regardless of the network.
+struct Gate {
+    offline: bool,
+    last_check: Instant,
+}
+
+impl Gate {
+    fn new(cfg: &Config) -> Self {
+        Self { offline: cfg.auto && is_offline(cfg), last_check: Instant::now() }
+    }
+
+    /// Automatic recording wanted right now (auto mode + off HQ WiFi).
+    fn auto_wanted(&mut self, cfg: &Config) -> bool {
+        if !cfg.auto {
+            return false;
+        }
+        if self.last_check.elapsed() >= cfg.check {
+            self.offline = is_offline(cfg);
+            self.last_check = Instant::now();
+        }
+        self.offline
+    }
+}
+
+fn run(bus: Arc<FrameBus>, cfg: Config, rec: Arc<Recorder>) {
     let mut last_seq = 0u64;
     let mut warned_no_drive = false;
 
     loop {
-        if !is_offline(&cfg) {
-            thread::sleep(cfg.check);
+        let manual = rec.manual();
+        let auto_now = !manual && cfg.auto && is_offline(&cfg);
+        if !manual && !auto_now {
+            idle(&cfg, &rec);
             continue;
         }
         if !mount_ready(&cfg.dir) {
-            if !warned_no_drive {
+            if manual {
+                log::error!("recorder: USB drive gone — manual recording stopped");
+                rec.manual.store(false, Ordering::Relaxed);
+            } else if !warned_no_drive {
                 log::warn!(
                     "recorder: off HQ WiFi but no USB drive mounted at {} — footage is NOT being saved",
                     cfg.dir.display()
                 );
                 warned_no_drive = true;
             }
-            thread::sleep(cfg.check);
+            idle(&cfg, &rec);
             continue;
         }
         warned_no_drive = false;
 
-        let session = if cfg.motion_gated {
-            record_motion_session(&bus, &cfg, &mut last_seq)
+        // Manual recording is always continuous; automatic follows HQCAM_MOTION_GATED.
+        let session = if manual || !cfg.motion_gated {
+            record_continuous_segment(&bus, &cfg, &rec, &mut last_seq)
         } else {
-            record_continuous_segment(&bus, &cfg, &mut last_seq)
+            record_motion_session(&bus, &cfg, &rec, &mut last_seq)
         };
+        rec.set_current(None);
         if let Err(e) = session {
             // Most likely the drive was pulled mid-write; back off and re-check.
             log::error!("recorder: segment ended early: {e}");
@@ -234,21 +383,25 @@ impl Segment {
 }
 
 /// Continuous mode: write one full segment, returning when it fills its time
-/// budget, when we come back online, or on the first I/O error.
-fn record_continuous_segment(bus: &FrameBus, cfg: &Config, last_seq: &mut u64) -> std::io::Result<()> {
+/// budget, when recording is no longer wanted (manual switched off and/or back
+/// on HQ WiFi), or on the first I/O error.
+fn record_continuous_segment(
+    bus: &FrameBus,
+    cfg: &Config,
+    rec: &Recorder,
+    last_seq: &mut u64,
+) -> std::io::Result<()> {
     let mut seg = Segment::open(cfg)?;
-    let mut last_check = Instant::now();
+    rec.set_current(Some(seg.final_path.clone()));
+    let mut gate = Gate::new(cfg);
 
     loop {
         if seg.elapsed() >= cfg.segment {
             break; // rotate to the next segment (re-prunes on the next open)
         }
-        if last_check.elapsed() >= cfg.check {
-            if !is_offline(cfg) {
-                log::info!("recorder: back on HQ WiFi — handing recording back to HQ");
-                break;
-            }
-            last_check = Instant::now();
+        if !rec.manual() && !gate.auto_wanted(cfg) {
+            log::info!("recorder: stopping (manual off / back on HQ WiFi)");
+            break;
         }
 
         let (frame, seq) = bus.wait_for(*last_seq);
@@ -265,7 +418,12 @@ fn record_continuous_segment(bus: &FrameBus, cfg: &Config, last_seq: &mut u64) -
 /// noticed after it starts), and recording continues for `motion_timeout` after
 /// motion stops. Returns when we come back online, the drive is removed, or on
 /// the first I/O error.
-fn record_motion_session(bus: &FrameBus, cfg: &Config, last_seq: &mut u64) -> std::io::Result<()> {
+fn record_motion_session(
+    bus: &FrameBus,
+    cfg: &Config,
+    rec: &Recorder,
+    last_seq: &mut u64,
+) -> std::io::Result<()> {
     let mut detector = MotionDetector::new(&cfg.motion);
     let max_preroll = (cfg.preroll.as_secs() as usize * CAPTURE_FPS as usize).max(1);
     let mut preroll: VecDeque<Arc<Vec<u8>>> = VecDeque::new();
@@ -273,13 +431,17 @@ fn record_motion_session(bus: &FrameBus, cfg: &Config, last_seq: &mut u64) -> st
     let mut seg: Option<Segment> = None;
     let mut last_motion: Option<Instant> = None;
     let mut last_check = Instant::now();
+    let mut gate = Gate::new(cfg);
 
     loop {
+        if rec.manual() {
+            break; // switch to manual (continuous) recording
+        }
+        if !gate.auto_wanted(cfg) {
+            log::info!("recorder: back on HQ WiFi — handing recording back to HQ");
+            break;
+        }
         if last_check.elapsed() >= cfg.check {
-            if !is_offline(cfg) {
-                log::info!("recorder: back on HQ WiFi — handing recording back to HQ");
-                break;
-            }
             if !mount_ready(&cfg.dir) {
                 break; // drive removed
             }
@@ -305,12 +467,14 @@ fn record_motion_session(bus: &FrameBus, cfg: &Config, last_seq: &mut u64) -> st
                     log::info!("recorder: motion stopped — ending clip");
                 }
                 seg.take().unwrap().close();
+                rec.set_current(None);
             }
         } else {
             push_preroll(&mut preroll, &mut preroll_bytes, frame, max_preroll);
             if motion_active {
                 log::info!("recorder: motion detected — starting clip");
                 let mut s = Segment::open(cfg)?;
+                rec.set_current(Some(s.final_path.clone()));
                 for f in preroll.drain(..) {
                     s.write(&f)?; // prepend the buffered lead-up (includes this frame)
                 }
@@ -370,7 +534,7 @@ fn is_offline(cfg: &Config) -> bool {
 /// True only if `dir` is a real mountpoint (a different filesystem than its
 /// parent). Guards against writing footage onto the SD card when the USB drive
 /// is absent or unmounted.
-fn mount_ready(dir: &Path) -> bool {
+pub(crate) fn mount_ready(dir: &Path) -> bool {
     let (Ok(here), Some(parent)) = (fs::metadata(dir), dir.parent()) else {
         return false;
     };
@@ -457,7 +621,7 @@ fn oldest_segment(base: &Path) -> Option<PathBuf> {
 
 /// Free megabytes on the filesystem holding `path`, via `df` (no extra crate,
 /// consistent with the project shelling out to `rpicam-vid`/`nmcli`).
-fn free_mb(path: &Path) -> Option<u64> {
+pub(crate) fn free_mb(path: &Path) -> Option<u64> {
     let out = Command::new("df").arg("-kP").arg(path).output().ok()?;
     if !out.status.success() {
         return None;
@@ -470,7 +634,7 @@ fn free_mb(path: &Path) -> Option<u64> {
 
 /// UTC (year, month, day) for a Unix timestamp — Howard Hinnant's
 /// civil-from-days, so no date crate is needed for folder names.
-fn ymd(secs: u64) -> (i64, u32, u32) {
+pub(crate) fn ymd(secs: u64) -> (i64, u32, u32) {
     let days = (secs / 86_400) as i64;
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
