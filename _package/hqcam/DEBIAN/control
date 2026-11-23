@@ -4,7 +4,7 @@ Section: video
 Priority: optional
 Architecture: armhf
 Maintainer: SodaPop Admin <Admin@SodaPopSystems.com>
-Depends: rpicam-apps | libcamera-apps, network-manager, dnsmasq-base, rsync, openssh-client, iw, usbutils, libturbojpeg0
+Depends: rpicam-apps | libcamera-apps, network-manager, dnsmasq-base, rsync, openssh-client, iw, usbutils, libturbojpeg0, curl
 Description: Coastal HQ CSI camera MJPEG streaming server
  Captures from the Raspberry Pi CSI camera via rpicam-vid and serves an
  MJPEG stream on port 6877 for the HQ Motion Eye system. Installs the

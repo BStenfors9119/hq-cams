@@ -123,6 +123,10 @@ function renderStatus(h, c, r, s) {
     ? `${s.count} saved on the ${storageName(s.storage)}${s.freeMb != null ? ` · ${(s.freeMb / 1024).toFixed(1)} GB free` : ""}`
     : "download only (no drive connected)", s.storage ? "" : "warn");
   add("USB drive", r.driveMounted ? `plugged in · ${r.freeMb != null ? (r.freeMb / 1024).toFixed(1) + " GB free" : ""}` : "not plugged in");
+  const u = last.uplink || {};
+  if (!u.configured) add("Barbie's Lab", "not connected (sudo hqcam connect)");
+  else if (u.connected) add("Barbie's Lab", `connected${u.streaming ? " · someone is watching" : ""}`, "ok");
+  else add("Barbie's Lab", u.lastError || "connecting…", "warn");
   add("Software", `hqcam ${h.version}`);
 
   $("#status").replaceChildren(...rows);

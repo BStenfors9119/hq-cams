@@ -6,6 +6,7 @@ mod rotate;
 mod settings;
 mod snapshot;
 mod status;
+mod uplink;
 
 use std::sync::Arc;
 use std::thread;
@@ -21,6 +22,18 @@ const BIND_ADDR: &str = "0.0.0.0:6877";
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // `hqcam connect|disconnect` are one-off commands; no arguments = the service.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("connect") => std::process::exit(uplink::connect_cli(&args[1..])),
+        Some("disconnect") => std::process::exit(uplink::disconnect_cli()),
+        Some(_) => {
+            eprintln!("{}", uplink::usage());
+            std::process::exit(2);
+        }
+    }
+
     let bus = FrameBus::new();
     // Orientation and focus start from the environment (record.conf) and can be
     // changed at runtime through the API, which also saves them back.
@@ -30,7 +43,9 @@ fn main() {
     // Saves footage to an attached USB drive whenever we're off the HQ network
     // (automatic, self-gating) or when Record is switched on in the web UI.
     let recorder = recorder::start(bus.clone());
-    let app = http::App { bus, cam, recorder, snapshots: Snapshots::from_env() };
+    let app = http::App { bus, cam, recorder, snapshots: Snapshots::from_env(), uplink: Default::default() };
+    // The link to Barbie's Lab (`hqcam connect`); idles until connected.
+    uplink::start(app.clone());
 
     let server = Arc::new(
         Server::http(BIND_ADDR).unwrap_or_else(|e| panic!("failed to bind {BIND_ADDR}: {e}")),

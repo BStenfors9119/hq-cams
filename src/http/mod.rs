@@ -41,6 +41,7 @@ use crate::recorder::{self, Recorder, RecorderStatus};
 use crate::settings::{self, OrientationChange};
 use crate::snapshot::{Snapshot, SnapshotError, Snapshots, Storage};
 use crate::status::{self, Health};
+use crate::uplink::{Uplink, UplinkStatus};
 
 const INDEX_HTML: &str = include_str!("ui/index.html");
 const APP_JS: &str = include_str!("ui/app.js");
@@ -56,6 +57,7 @@ pub struct App {
     pub cam: Arc<CamControl>,
     pub recorder: Arc<Recorder>,
     pub snapshots: Arc<Snapshots>,
+    pub uplink: Arc<Uplink>,
 }
 
 type Reply = Response<Cursor<Vec<u8>>>;
@@ -229,11 +231,13 @@ fn serve_snapshot(request: Request, snapshots: &Snapshots, date: &str, name: &st
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FullStatus {
+pub(crate) struct FullStatus {
     health: Health,
     camera: CameraStatus,
     recorder: RecorderStatus,
     snapshots: SnapshotsStatus,
+    /// The link to Barbie's Lab.
+    uplink: UplinkStatus,
 }
 
 #[derive(Serialize)]
@@ -261,7 +265,8 @@ struct SnapshotsStatus {
     latest: Option<Snapshot>,
 }
 
-fn full_status(app: &App) -> FullStatus {
+/// Everything `/api/status` reports; also what the uplink sends Barbie's Lab.
+pub(crate) fn full_status(app: &App) -> FullStatus {
     let Capture { width, height, framerate, quality } = app.cam.capture();
     let storage = app.snapshots.storage();
     let mut list = app.snapshots.list();
@@ -285,6 +290,7 @@ fn full_status(app: &App) -> FullStatus {
             count,
             latest: if list.is_empty() { None } else { Some(list.swap_remove(0)) },
         },
+        uplink: app.uplink.status(),
     }
 }
 

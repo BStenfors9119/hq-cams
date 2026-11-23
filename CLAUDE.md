@@ -44,7 +44,16 @@ Tests are minimal: `cargo test` runs the motion-detector unit tests in `src/reco
 - **Manual record** (`POST /api/record {"on":true}`): `Recorder::set_manual` in `src/recorder/`. Always continuous, works online or offline, still USB-only (409 with no drive). The recorder thread now always runs; `HQCAM_RECORD=0` only disables the *automatic* offline mode.
 - **Orientation / focus** (`POST /api/orientation`, `/api/focus`): applied live (capture restarts, ~1s blip) and **saved to `record.conf`** by `src/conf/` (replaces active `KEY=` lines, else uncomments the documented `#KEY=` line, else appends; atomic rename). The legacy `/orientation?…` query form still works but is in-memory only.
 
-Planned next: a cam → barbies-lab uplink (outbound only, device token) so pictures land on the HQ server and barbies-lab drives Take a Pic / live view; then VPN-based backup to the SodaPop network drive.
+## Barbie's Lab link (`src/uplink/`)
+
+Lets a camera be watched and driven from www.barbieslab.com (barbies-lab's `cameras` module, `~/dev/barbies-lab`) — **outbound only**, so it works from any home network without port forwarding or a VPN.
+
+- `sudo hqcam connect [URL] [--name N] [--label L]` signs in once with a Barbie's Lab login (needs `cameras.control`; password used once, never stored) and writes the token to `/usr/local/etc/hqcam/uplink.conf` (0600; `HQCAM_UPLINK_CONF` overrides). Default URL `https://www.barbieslab.com` — **use www**: the bare domain 301-redirects, which turns POSTs into GETs. `sudo hqcam disconnect` removes it (revoke on barbies-lab's Users screen to kill the token itself). Username/password come from stdin lines when not on a TTY (scriptable).
+- The service's uplink thread re-reads `uplink.conf` every round (connect/disconnect apply within seconds, even mid back-off) and **long-polls** `POST /api/cameras/feed/poll` with the full `/api/status` JSON. Commands: `snapshot` → next frame to `/feed/pictures?command=` (memory only — nothing on the SD card), `settings` → `src/settings/` (same code as the local UI, saved to record.conf). Live view: while the poll says `live`, ~1 frame/s to `/feed/frame` until it answers `live:false`; polls carry `streaming:true` meanwhile so they're still held.
+- HTTP is **`curl`** (deb dep), not a TLS crate: pure-Rust cross-compile, small binary. The token reaches curl via a root-only `-K` config in `/run/hqcam/` (`HQCAM_RUN_DIR`), never argv/`ps`.
+- 401/403 → logged "access was removed; run `sudo hqcam connect` again", 2 min back-off; network errors back off 5→60 s. State is in `/api/status` → `uplink` and on the local page.
+
+Planned next: VPN-based backup to the SodaPop network drive.
 
 ## WiFi fallback hotspot (vehicle access)
 
