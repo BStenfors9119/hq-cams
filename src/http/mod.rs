@@ -11,6 +11,9 @@
 //! GET    /api/status                     health + camera + recorder + snapshots
 //! GET    /api/snapshots                  saved pictures, newest first
 //! POST   /api/snapshots                  Take a Pic -> 201 + the new picture
+//!                                        (409 when no USB/network drive is mounted)
+//! POST   /api/snapshots/download         Take a Pic, download-only: the JPEG comes
+//!                                        back as an attachment, never saved on the camera
 //! DELETE /api/snapshots/{date}/{name}
 //! GET    /snapshots/{date}/{name}        a saved picture (?download=1 to save it)
 //! GET    /api/record                     recorder status
@@ -36,7 +39,7 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use crate::cam::{self, CamControl, Capture, FrameBus, MjpegStream, Orientation};
 use crate::conf;
 use crate::recorder::{self, Recorder, RecorderStatus};
-use crate::snapshot::{Snapshot, SnapshotError, Snapshots};
+use crate::snapshot::{Snapshot, SnapshotError, Snapshots, Storage};
 use crate::status::{self, Health};
 
 const INDEX_HTML: &str = include_str!("ui/index.html");
@@ -88,6 +91,24 @@ fn jpeg(bytes: Vec<u8>) -> Reply {
         .with_header(header("Cache-Control", "no-store"))
 }
 
+fn snapshot_error(e: SnapshotError) -> Reply {
+    match e {
+        SnapshotError::NoFrame => error(503, e),
+        SnapshotError::NoStorage => error(409, e),
+        SnapshotError::Io(_) => error(500, e),
+    }
+}
+
+/// A download-only picture: straight from memory to the requesting device.
+/// Named `hqcam-YYYY-MM-DD-HHMMSS.jpg` (UTC) so repeated downloads don't collide.
+fn download_only(bytes: Vec<u8>) -> Reply {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_secs());
+    let (y, m, d) = recorder::ymd(secs);
+    let t = secs % 86_400;
+    let name = format!("hqcam-{y:04}-{m:02}-{d:02}-{:02}{:02}{:02}.jpg", t / 3600, t / 60 % 60, t % 60);
+    jpeg(bytes).with_header(header("Content-Disposition", &format!("attachment; filename=\"{name}\"")))
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result<T, Reply> {
     let mut body = String::new();
     request
@@ -129,9 +150,12 @@ pub fn handle(mut request: Request, app: App) {
 
         (Method::Get, ["api", "snapshots"]) => json(200, &app.snapshots.list()),
         (Method::Post, ["api", "snapshots"]) => match app.snapshots.take(&app.bus) {
-            Ok(s) => json(201, &s),
-            Err(e @ SnapshotError::NoFrame) => error(503, e),
-            Err(e) => error(500, e),
+            Ok((snap, _)) => json(201, &snap),
+            Err(e) => snapshot_error(e),
+        },
+        (Method::Post, ["api", "snapshots", "download"]) => match app.snapshots.grab(&app.bus) {
+            Ok(frame) => download_only(frame.to_vec()),
+            Err(e) => snapshot_error(e),
         },
         (Method::Delete, ["api", "snapshots", date, name]) => match app.snapshots.delete(date, name) {
             Ok(true) => Response::from_string("").with_status_code(StatusCode(204)),
@@ -230,7 +254,8 @@ struct CameraStatus {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotsStatus {
-    dir: String,
+    /// Where pictures are saved; `null` = no drive, download-only.
+    storage: Option<Storage>,
     count: usize,
     free_mb: Option<u64>,
     latest: Option<Snapshot>,
@@ -238,6 +263,7 @@ struct SnapshotsStatus {
 
 fn full_status(app: &App) -> FullStatus {
     let Capture { width, height, framerate, quality } = app.cam.capture();
+    let storage = app.snapshots.storage();
     let mut list = app.snapshots.list();
     let count = list.len();
     FullStatus {
@@ -254,9 +280,9 @@ fn full_status(app: &App) -> FullStatus {
         },
         recorder: app.recorder.status(),
         snapshots: SnapshotsStatus {
-            dir: app.snapshots.dir().display().to_string(),
+            free_mb: storage.as_ref().and_then(|s| recorder::free_mb(&s.mount)),
+            storage,
             count,
-            free_mb: recorder::free_mb(app.snapshots.dir()),
             latest: if list.is_empty() { None } else { Some(list.swap_remove(0)) },
         },
     }

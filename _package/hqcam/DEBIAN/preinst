@@ -1,0 +1,18 @@
+#!/bin/bash
+# Ported from tsr's preinst. Stop the running service and clear the old binary
+# before the new files unpack, so the camera is released and postinst's
+# binary install starts from a clean /usr/local/bin.
+set -e
+
+if [ -f /etc/systemd/system/hqcam.service ]; then
+    systemctl stop hqcam 2>/dev/null || true
+fi
+
+if [ -f /usr/local/bin/hqcam ]; then
+    rm -f /usr/local/bin/hqcam
+fi
+# Only the staged binaries (hqcam-<arch>, plus the legacy per-glibc
+# hqcam-<arch>-2.NN) — leave sibling tools such as hqcam-hotspot in place.
+rm -f /usr/local/bin/hqcam-arm64 /usr/local/bin/hqcam-armhf /usr/local/bin/hqcam-*-2.*
+
+exit 0

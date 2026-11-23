@@ -16,8 +16,26 @@ async function api(method, path, body) {
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+  if (!res.ok) throw Object.assign(new Error(data.error || `${res.status} ${res.statusText}`), { status: res.status });
   return data;
+}
+
+// Download-only picture: the camera sends the JPEG straight back and keeps no
+// copy, so hand it to the browser as a file download.
+async function downloadPic() {
+  const res = await fetch("/api/snapshots/download", { method: "POST" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `${res.status} ${res.statusText}`);
+  }
+  const blob = await res.blob();
+  const match = (res.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/);
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: match ? match[1] : "hqcam.jpg" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
 let toastTimer;
@@ -72,6 +90,7 @@ async function refreshStatus() {
   $("#temp").className = `pill ${tempClass(h.tempC)}`;
 
   renderStatus(h, c, r, s);
+  renderStorage(s.storage);
   renderRecord(r);
   renderSettings(c);
   if (s.count !== photoCount) refreshPhotos();
@@ -100,11 +119,25 @@ function renderStatus(h, c, r, s) {
   else add("WiFi", "not connected (or hotspot mode)", "warn");
   if (h.uptimeSecs != null) add("Up for", duration(h.uptimeSecs));
   add("Picture", `${c.width}×${c.height} at ${c.framerate} fps`);
-  add("Pictures saved", `${s.count}${s.freeMb != null ? ` · ${(s.freeMb / 1024).toFixed(1)} GB free` : ""}`);
+  add("Pictures", s.storage
+    ? `${s.count} saved on the ${storageName(s.storage)}${s.freeMb != null ? ` · ${(s.freeMb / 1024).toFixed(1)} GB free` : ""}`
+    : "download only (no drive connected)", s.storage ? "" : "warn");
   add("USB drive", r.driveMounted ? `plugged in · ${r.freeMb != null ? (r.freeMb / 1024).toFixed(1) + " GB free" : ""}` : "not plugged in");
   add("Software", `hqcam ${h.version}`);
 
   $("#status").replaceChildren(...rows);
+}
+
+function storageName(st) {
+  return st.kind === "network" ? "network drive" : "USB drive";
+}
+
+function renderStorage(st) {
+  $("#snap").textContent = st ? "Take a Pic" : "Take a Pic & download";
+  $("#snap-note").textContent = st
+    ? `Pictures are saved to the ${storageName(st)}.`
+    : "No USB or network drive is connected, so the camera can't keep pictures. Each one downloads straight to this device instead.";
+  $("#photos-section").hidden = !st;
 }
 
 function renderRecord(r) {
@@ -178,9 +211,19 @@ $("#snap").addEventListener("click", async (ev) => {
   const b = ev.currentTarget;
   b.disabled = true;
   try {
-    await api("POST", "/api/snapshots");
-    toast("Picture saved");
-    refreshPhotos();
+    if (last && last.snapshots.storage) {
+      try {
+        await api("POST", "/api/snapshots");
+        toast("Picture saved");
+        refreshPhotos();
+        return;
+      } catch (e) {
+        if (e.status !== 409) throw e; // 409: the drive went away since the last check
+      }
+    }
+    await downloadPic();
+    toast("Picture downloaded to this device");
+    refreshStatus();
   } catch (e) {
     toast(`No picture taken: ${e.message}`, true);
   } finally {

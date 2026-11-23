@@ -1,14 +1,23 @@
-//! Snapshots: "Take a Pic" saves the next live frame as a JPEG.
+//! Snapshots: "Take a Pic" grabs the next live frame as a JPEG.
 //!
 //! The frame is already a JPEG off the [`FrameBus`], so a snapshot costs no
 //! capture or encode work — it's the stream's resolution, not full sensor.
-//! Files follow the project's media convention:
-//! `<dir>/YYYY-MM-DD/<n>.jpg`.
 //!
-//! Unlike the video recorder, snapshots may live on the SD card (the default
-//! dir is `/var/lib/hqcam/snapshots`, so a porch cam without a USB drive still
-//! works). They're small, and the folder is capped at `HQCAM_SNAPSHOT_MAX_MB`
-//! by pruning the oldest, so they can never fill the OS disk.
+//! **Never written to the SD card.** A picture is saved only to real external
+//! storage, checked per request:
+//! 1. a mounted network drive (`HQCAM_NETWORK_DIR`, unset by default) —
+//!    preferred, because it's off the device (a stolen camera takes nothing
+//!    with it);
+//! 2. the USB drive (`HQCAM_RECORD_DIR`, default `/media/hqcam`).
+//!
+//! Each must be a real mountpoint ([`mount_ready`]), so an unmounted target is
+//! "no storage", never a folder on the SD card. Saved files follow the media
+//! convention under a `snapshots` folder: `<target>/snapshots/YYYY-MM-DD/<n>.jpg`,
+//! capped at `HQCAM_SNAPSHOT_MAX_MB` by pruning the oldest.
+//!
+//! With no storage, a picture can still be taken **download-only**
+//! ([`Snapshots::grab`]): the frame goes straight back to the device that asked
+//! for it in the HTTP response, held only in memory.
 
 use std::fs;
 use std::io;
@@ -19,9 +28,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::cam::FrameBus;
-use crate::recorder::ymd;
+use crate::recorder::{mount_ready, ymd};
 
-const DEFAULT_DIR: &str = "/var/lib/hqcam/snapshots";
+const DEFAULT_USB_DIR: &str = "/media/hqcam";
+/// Sub-folder of a storage target that holds the pictures (video segments use
+/// the target's top-level date folders).
+const SUBDIR: &str = "snapshots";
 const DEFAULT_MAX_MB: u64 = 200;
 
 /// How long to wait for a fresh frame before giving up (capture stalled).
@@ -46,6 +58,8 @@ pub struct Snapshot {
 pub enum SnapshotError {
     /// No frame arrived in time — the camera isn't producing frames.
     NoFrame,
+    /// No network or USB drive to save to; only a download-only picture works.
+    NoStorage,
     Io(io::Error),
 }
 
@@ -53,51 +67,102 @@ impl std::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoFrame => write!(f, "the camera isn't sending pictures right now"),
+            Self::NoStorage => write!(
+                f,
+                "no USB or network drive is connected, so pictures can't be saved on the camera — download it instead"
+            ),
             Self::Io(e) => write!(f, "couldn't save the picture: {e}"),
         }
     }
 }
 
+/// Where pictures are being saved right now.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum StorageKind {
+    Network,
+    Usb,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Storage {
+    pub kind: StorageKind,
+    /// The folder pictures go in (`<target>/snapshots`).
+    pub dir: PathBuf,
+    /// The mounted drive the folder is on.
+    #[serde(skip)]
+    pub mount: PathBuf,
+}
+
+type ReadyFn = Box<dyn Fn(&Path) -> bool + Send + Sync>;
+
 pub struct Snapshots {
-    dir: PathBuf,
+    /// Candidate drives in order of preference.
+    targets: Vec<(StorageKind, PathBuf)>,
+    /// Is this target mounted? ([`mount_ready`]; swapped out in tests.)
+    ready: ReadyFn,
     max_bytes: u64,
-    /// Serialises take/delete so two clicks can't pick the same number.
+    /// Serialises save/delete so two clicks can't pick the same number.
     lock: Mutex<()>,
 }
 
 impl Snapshots {
-    /// `HQCAM_SNAPSHOT_DIR` (default `/var/lib/hqcam/snapshots`) and
+    /// `HQCAM_NETWORK_DIR` (a mounted network share; unset = none),
+    /// `HQCAM_RECORD_DIR` (the USB drive, default `/media/hqcam`) and
     /// `HQCAM_SNAPSHOT_MAX_MB` (default 200).
     pub fn from_env() -> Arc<Self> {
-        let dir: PathBuf = std::env::var("HQCAM_SNAPSHOT_DIR").unwrap_or_else(|_| DEFAULT_DIR.into()).into();
+        let mut targets = Vec::new();
+        if let Some(net) = std::env::var("HQCAM_NETWORK_DIR").ok().filter(|v| !v.trim().is_empty()) {
+            targets.push((StorageKind::Network, PathBuf::from(net.trim())));
+        }
+        let usb = std::env::var("HQCAM_RECORD_DIR").unwrap_or_else(|_| DEFAULT_USB_DIR.into());
+        targets.push((StorageKind::Usb, usb.into()));
         let max_mb = std::env::var("HQCAM_SNAPSHOT_MAX_MB")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DEFAULT_MAX_MB);
-        log::info!("snapshots: {} (keeps the newest {max_mb} MB)", dir.display());
-        Arc::new(Self::new(dir, max_mb))
+        let names: Vec<String> = targets.iter().map(|(k, p)| format!("{k:?} {}", p.display())).collect();
+        log::info!(
+            "snapshots: saved to the first mounted of [{}] (newest {max_mb} MB kept); none mounted => download-only",
+            names.join(", ")
+        );
+        Arc::new(Self::new(targets, max_mb, Box::new(mount_ready)))
     }
 
-    fn new(dir: PathBuf, max_mb: u64) -> Self {
-        Self { dir, max_bytes: max_mb * 1024 * 1024, lock: Mutex::new(()) }
+    fn new(targets: Vec<(StorageKind, PathBuf)>, max_mb: u64, ready: ReadyFn) -> Self {
+        Self { targets, ready, max_bytes: max_mb * 1024 * 1024, lock: Mutex::new(()) }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// The storage pictures are saved to right now, or `None` (download-only).
+    pub fn storage(&self) -> Option<Storage> {
+        self.targets.iter().find(|(_, p)| (self.ready)(p)).map(|(kind, p)| Storage {
+            kind: *kind,
+            dir: p.join(SUBDIR),
+            mount: p.clone(),
+        })
     }
 
-    /// Save the next live frame. Prunes the oldest snapshots first if the
-    /// folder is over its cap.
-    pub fn take(&self, bus: &FrameBus) -> Result<Snapshot, SnapshotError> {
+    /// Save the next live frame to the current storage. Fails with
+    /// [`SnapshotError::NoStorage`] when there is none — use [`grab`](Self::grab).
+    pub fn take(&self, bus: &FrameBus) -> Result<(Snapshot, Storage), SnapshotError> {
+        let storage = self.storage().ok_or(SnapshotError::NoStorage)?;
         let frame = bus.next_frame(FRAME_TIMEOUT).ok_or(SnapshotError::NoFrame)?;
-        self.save(&frame).map_err(SnapshotError::Io)
+        let snap = self.save(&storage.dir, &frame).map_err(SnapshotError::Io)?;
+        Ok((snap, storage))
     }
 
-    fn save(&self, jpeg: &[u8]) -> io::Result<Snapshot> {
+    /// Download-only: the next live frame, held in memory and never written
+    /// anywhere on the camera.
+    pub fn grab(&self, bus: &FrameBus) -> Result<Arc<Vec<u8>>, SnapshotError> {
+        bus.next_frame(FRAME_TIMEOUT).ok_or(SnapshotError::NoFrame)
+    }
+
+    fn save(&self, dir: &Path, jpeg: &[u8]) -> io::Result<Snapshot> {
         let _guard = self.lock.lock().unwrap();
         let (y, m, d) = ymd(now_secs());
         let date = format!("{y:04}-{m:02}-{d:02}");
-        let day = self.dir.join(&date);
+        let day = dir.join(&date);
         fs::create_dir_all(&day)?;
         let name = format!("{}.jpg", next_index(&day));
         let path = day.join(&name);
@@ -106,16 +171,18 @@ impl Snapshots {
         fs::write(&tmp, jpeg)?;
         fs::rename(&tmp, &path)?;
         log::info!("snapshot: saved {}", path.display());
-        self.prune();
+        self.prune(dir);
         Ok(entry(&date, &name, &path).expect("file was just written"))
     }
 
-    /// All snapshots, newest first.
+    /// The pictures on the current storage, newest first (empty with none).
     pub fn list(&self) -> Vec<Snapshot> {
+        let Some(storage) = self.storage() else { return Vec::new() };
+        let dir = storage.dir;
         let mut all = Vec::new();
-        for date in day_folders(&self.dir) {
-            for (_, name) in files_in(&self.dir.join(&date)) {
-                if let Some(s) = entry(&date, &name, &self.dir.join(&date).join(&name)) {
+        for date in day_folders(&dir) {
+            for (_, name) in files_in(&dir.join(&date)) {
+                if let Some(s) = entry(&date, &name, &dir.join(&date).join(&name)) {
                     all.push(s);
                 }
             }
@@ -130,7 +197,7 @@ impl Snapshots {
         if !is_date(date) || index_of(name).is_none() {
             return None;
         }
-        let p = self.dir.join(date).join(name);
+        let p = self.storage()?.dir.join(date).join(name);
         p.is_file().then_some(p)
     }
 
@@ -141,17 +208,19 @@ impl Snapshots {
             return Ok(false);
         };
         fs::remove_file(&p)?;
-        remove_if_empty(&self.dir.join(date));
+        if let Some(day) = p.parent() {
+            remove_if_empty(day);
+        }
         log::info!("snapshot: deleted {}", p.display());
         Ok(true)
     }
 
-    /// Delete the oldest snapshots until the folder is within its cap.
-    fn prune(&self) {
+    /// Delete the oldest snapshots in `dir` until it is within its cap.
+    fn prune(&self, dir: &Path) {
         let mut files: Vec<(String, u64, String, u64)> = Vec::new(); // date, index, name, bytes
-        for date in day_folders(&self.dir) {
-            for (i, name) in files_in(&self.dir.join(&date)) {
-                let bytes = fs::metadata(self.dir.join(&date).join(&name)).map(|m| m.len()).unwrap_or(0);
+        for date in day_folders(dir) {
+            for (i, name) in files_in(&dir.join(&date)) {
+                let bytes = fs::metadata(dir.join(&date).join(&name)).map(|m| m.len()).unwrap_or(0);
                 files.push((date.clone(), i, name, bytes));
             }
         }
@@ -161,7 +230,7 @@ impl Snapshots {
             if total <= self.max_bytes {
                 break;
             }
-            let day = self.dir.join(&date);
+            let day = dir.join(&date);
             if fs::remove_file(day.join(&name)).is_ok() {
                 log::info!("snapshot: over the size cap — pruned {date}/{name}");
                 total -= bytes;
@@ -238,11 +307,23 @@ fn remove_if_empty(day: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    fn temp_store(tag: &str, max_mb: u64) -> Snapshots {
+    fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hqcam-snap-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        Snapshots::new(dir, max_mb)
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A store whose single USB target is always "mounted".
+    fn usb_store(tag: &str, max_mb: u64) -> (Snapshots, PathBuf) {
+        let dir = temp_dir(tag);
+        (Snapshots::new(vec![(StorageKind::Usb, dir.clone())], max_mb, Box::new(|_| true)), dir)
+    }
+
+    fn save(s: &Snapshots, bytes: &[u8]) -> Snapshot {
+        s.save(&s.storage().unwrap().dir, bytes).unwrap()
     }
 
     #[test]
@@ -257,12 +338,44 @@ mod tests {
     }
 
     #[test]
+    fn no_mounted_target_means_no_storage_and_nothing_written() {
+        let dir = temp_dir("none");
+        let s = Snapshots::new(vec![(StorageKind::Usb, dir.clone())], 200, Box::new(|_| false));
+        assert_eq!(s.storage(), None);
+        assert!(s.list().is_empty());
+        assert!(s.path_of("2026-11-22", "1.jpg").is_none());
+        let bus = FrameBus::new();
+        assert!(matches!(s.take(&bus), Err(SnapshotError::NoStorage)));
+        assert!(!dir.join(SUBDIR).exists(), "nothing created on an unmounted target");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prefers_the_network_drive_and_falls_back_to_usb() {
+        let net = PathBuf::from("/net");
+        let usb = PathBuf::from("/usb");
+        let net_up = Arc::new(AtomicBool::new(true));
+        let flag = net_up.clone();
+        let s = Snapshots::new(
+            vec![(StorageKind::Network, net.clone()), (StorageKind::Usb, usb.clone())],
+            200,
+            Box::new(move |p| p != Path::new("/net") || flag.load(Ordering::Relaxed)),
+        );
+        let st = s.storage().unwrap();
+        assert_eq!((st.kind, st.dir), (StorageKind::Network, net.join(SUBDIR)));
+        net_up.store(false, Ordering::Relaxed);
+        let st = s.storage().unwrap();
+        assert_eq!((st.kind, st.dir), (StorageKind::Usb, usb.join(SUBDIR)));
+    }
+
+    #[test]
     fn saves_numbered_files_lists_newest_first_and_deletes() {
-        let s = temp_store("basic", 200);
-        let a = s.save(b"one").unwrap();
-        let b = s.save(b"two").unwrap();
+        let (s, dir) = usb_store("basic", 200);
+        let a = save(&s, b"one");
+        let b = save(&s, b"two");
         assert_eq!((a.name.as_str(), b.name.as_str()), ("1.jpg", "2.jpg"));
         assert_eq!(a.url, format!("/snapshots/{}/1.jpg", a.date));
+        assert!(dir.join(SUBDIR).join(&a.date).join("1.jpg").is_file());
         let names: Vec<_> = s.list().into_iter().map(|x| x.name).collect();
         assert_eq!(names, ["2.jpg", "1.jpg"]);
         assert!(s.path_of(&a.date, "1.jpg").is_some());
@@ -271,18 +384,18 @@ mod tests {
         assert!(!s.delete(&a.date, "1.jpg").unwrap());
         assert!(s.delete(&a.date, "2.jpg").unwrap());
         assert!(s.list().is_empty());
-        assert!(!s.dir.join(&a.date).exists(), "empty day folder removed");
-        fs::remove_dir_all(&s.dir).unwrap();
+        assert!(!dir.join(SUBDIR).join(&a.date).exists(), "empty day folder removed");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn prunes_oldest_over_the_cap() {
-        let mut s = temp_store("prune", 0);
+        let (mut s, dir) = usb_store("prune", 0);
         s.max_bytes = 10;
-        s.save(b"123456").unwrap();
-        s.save(b"abcdef").unwrap(); // 12 bytes > 10: 1.jpg goes
+        save(&s, b"123456");
+        save(&s, b"abcdef"); // 12 bytes > 10: 1.jpg goes
         let names: Vec<_> = s.list().into_iter().map(|x| x.name).collect();
         assert_eq!(names, ["2.jpg"]);
-        fs::remove_dir_all(&s.dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

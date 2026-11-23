@@ -13,7 +13,7 @@ VER=$(grep 'Version:' $CONTROL_FILE | awk -F":" '{print$2}' | tr -d '[:space:]')
 
 echo $VER
 echo ${DEB_PKG}_${VER}_${ARCH}
-dpkg --build $DEB_PKG
+dpkg --build $DEB_PKG || exit 1
 
-mv ${DEB_PKG}.deb ${DEB_PKG}_${VER}_${ARCH}.deb
-bash ./repackage-without-zstd.sh ${DEB_PKG}_${VER}_${ARCH}
+mv ${DEB_PKG}.deb ${DEB_PKG}_${VER}_${ARCH}.deb || exit 1
+bash ./repackage-without-zstd.sh ${DEB_PKG}_${VER}_${ARCH} || exit 1

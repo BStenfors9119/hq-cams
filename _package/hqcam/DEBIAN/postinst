@@ -1,0 +1,107 @@
+#!/bin/bash
+# Ported from tsr's postinst (binary-selection portion only — hqcam has none of
+# the TSR app/config/CEC logic). The deb ships ONE hqcam per arch, staged as
+# hqcam-<arch> and linked against the glibc 2.24 floor (glibc is backward
+# compatible, so it runs on every Pi OS from Stretch up). Move it into place,
+# then enable + start the service.
+echo "Installing hqcam"
+
+lddv=$(ldd --version | grep ldd | awk '{print $NF}')
+arch=$(dpkg --print-architecture)
+echo "Installing hqcam for arch=$arch (glibc $lddv)"
+
+STAGED_BIN="/usr/local/bin/hqcam-$arch"
+if [ ! -f "$STAGED_BIN" ]; then
+    echo "ERROR: $STAGED_BIN missing — this deb has no hqcam binary for $arch" >&2
+    exit 1
+fi
+mv "$STAGED_BIN" /usr/local/bin/hqcam
+# Staged binaries only, named explicitly (new hqcam-<arch> + legacy per-glibc
+# hqcam-<arch>-2.NN) so hqcam-hotspot / hqcam-sync etc. are kept.
+rm -f /usr/local/bin/hqcam-arm64 /usr/local/bin/hqcam-armhf /usr/local/bin/hqcam-*-2.*
+chmod 755 /usr/local/bin/hqcam
+chmod 644 /etc/systemd/system/hqcam.service
+
+systemctl daemon-reload
+systemctl enable hqcam
+# restart (not just start) so an upgrade picks up the new binary.
+systemctl restart hqcam
+
+# --- WiFi power management ---------------------------------------------------
+# Disable WiFi power-save for a more reliable link at range (e.g. joining HQ
+# from the parking lot). The drop-in is shipped to conf.d; reload NM so it takes
+# effect. `reload` re-reads config without tearing down the active connection.
+chmod 644 /etc/NetworkManager/conf.d/wifi-powersave-off.conf
+systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager || true
+
+# --- WiFi fallback hotspot ---------------------------------------------------
+# Join HQ WiFi when in range, else broadcast an AP so the cam is reachable in
+# the vehicle at http://10.42.0.1:6877. See /usr/local/etc/hqcam/hotspot.conf.
+chmod 755 /usr/local/bin/hqcam-hotspot
+chmod 644 /etc/systemd/system/hqcam-hotspot.service /etc/systemd/system/hqcam-hotspot.timer
+
+# Install config on first install only, so an edited SSID/password survives upgrades.
+if [ ! -f /usr/local/etc/hqcam/hotspot.conf ]; then
+    cp /usr/local/etc/hqcam/hotspot.conf.default /usr/local/etc/hqcam/hotspot.conf
+    echo "Installed default hotspot.conf — edit AP_SSID/AP_PASSWORD in /usr/local/etc/hqcam/hotspot.conf"
+fi
+
+# DEACTIVATED: the fallback AP was holding the radio and keeping cams from
+# rejoining HQ WiFi. The script + units still ship (for manual use:
+# `sudo hqcam-hotspot on|off|status`), but the timer is no longer enabled, and
+# upgrades turn it off on devices that already had it running.
+# To re-activate, restore:
+#   systemctl enable hqcam-hotspot.timer
+#   systemctl start hqcam-hotspot.timer
+systemctl disable --now hqcam-hotspot.timer 2>/dev/null || true
+systemctl stop hqcam-hotspot.service 2>/dev/null || true
+# Drop the AP if it's up so NetworkManager can rejoin a known network (HQ).
+/usr/local/bin/hqcam-hotspot off 2>/dev/null || true
+
+# --- Offline USB recorder ----------------------------------------------------
+# Save footage to a USB drive while off the HQ network so nothing is lost. See
+# /usr/local/etc/hqcam/record.conf. The recorder is built into the hqcam binary;
+# here we just install its config and the drive mount unit.
+chmod 644 /etc/systemd/system/media-hqcam.mount
+
+# Install recorder config on first install only, so edited tuning survives upgrades.
+if [ ! -f /usr/local/etc/hqcam/record.conf ]; then
+    cp /usr/local/etc/hqcam/record.conf.default /usr/local/etc/hqcam/record.conf
+    echo "Installed default record.conf — label a USB drive HQCAM to enable recording"
+fi
+
+# Best-effort mount of an HQCAM-labelled USB drive at /media/hqcam. The mount is
+# keyed to the drive's udev device unit (see media-hqcam.mount [Install]), so it
+# starts only when that drive is actually present — a diskless boot is a silent
+# no-op instead of the "dependency job failed" error a target-wanted mount gives.
+# `reenable` also clears any stale multi-user.target.wants symlink left by older
+# packages that enabled the mount there.
+systemctl reenable media-hqcam.mount || true
+# Mount now only if the drive is already attached; otherwise the device unit will
+# pull it in when the drive appears. Guarding on presence avoids a noisy failed
+# `start` during a diskless install.
+if [ -e /dev/disk/by-label/HQCAM ]; then
+    systemctl start media-hqcam.mount || true
+fi
+
+# --- Footage sync to HQ ------------------------------------------------------
+# When back on HQ, rsync recorded clips off the USB drive to HQ storage and free
+# local space. Opt-in: does nothing until SYNC_ENABLED=yes and SYNC_DEST are set
+# in /usr/local/etc/hqcam/sync.conf. The script is a standalone shell tool.
+chmod 755 /usr/local/bin/hqcam-sync
+chmod 644 /etc/systemd/system/hqcam-sync.service /etc/systemd/system/hqcam-sync.timer
+
+# 5 GHz USB dongle diagnostic (read-only; run manually as `hqcam-verify-dongle`).
+chmod 755 /usr/local/bin/hqcam-verify-dongle
+
+# Dual-radio setup helper (run manually as `sudo hqcam-dual-radio`).
+chmod 755 /usr/local/bin/hqcam-dual-radio
+
+# Install sync config on first install only, so an edited dest survives upgrades.
+if [ ! -f /usr/local/etc/hqcam/sync.conf ]; then
+    cp /usr/local/etc/hqcam/sync.conf.default /usr/local/etc/hqcam/sync.conf
+    echo "Installed default sync.conf — set SYNC_ENABLED=yes and SYNC_DEST to enable footage sync"
+fi
+
+systemctl enable hqcam-sync.timer
+systemctl start hqcam-sync.timer

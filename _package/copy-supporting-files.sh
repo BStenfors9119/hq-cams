@@ -4,7 +4,13 @@
 # the same shape with hqcam's (short) file lists.
 RC=$1
 
-cd ~/dev/hq/cams
+# Any missing source file must fail the build — otherwise the deb ships without
+# its units/scripts and still "succeeds".
+set -e
+
+# Repo root = this script's parent dir, so it works from any clone (the sp-builder
+# on Frasier clones to its own work dir; a hardcoded ~/dev/hq/cams doesn't exist there).
+cd "$(dirname "$0")/.."
 
 PKG_SUPPORTING_TOOLING_FILES_PATH=_package/hqcam/usr/local/etc/hqcam/_tooling
 PKG_SUPPORTING_SYSTEMD_FILES_PATH=_package/hqcam/etc/systemd/system

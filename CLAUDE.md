@@ -40,7 +40,7 @@ Tests are minimal: `cargo test` runs the motion-detector unit tests in `src/reco
 `src/http/mod.rs` serves the UI (`src/http/ui/` — plain HTML/CSS/JS, embedded with `include_str!`) and a JSON API on the same port. The full route list is the doc comment at the top of that file. **LAN only, no login.**
 
 - **Status** (`GET /api/status`): `src/status/` reads temp, `vcgencmd get_throttled` (decoded), load, memory, WiFi (`nmcli … --rescan no`, never forces a scan), plus camera/recorder/snapshot state. Unreadable sources are `null`.
-- **Snapshots** (`src/snapshot/`): "Take a Pic" saves the next live frame (no extra capture/encode; stream resolution) to `<HQCAM_SNAPSHOT_DIR>/YYYY-MM-DD/<n>.jpg`. Deliberate exception to "never the SD card": the default dir is `/var/lib/hqcam/snapshots`, capped at `HQCAM_SNAPSHOT_MAX_MB` (200) by pruning the oldest. Names are validated so requests can't escape the folder.
+- **Snapshots** (`src/snapshot/`): "Take a Pic" grabs the next live frame (no extra capture/encode; stream resolution). **Never saved on the SD card** (owner requirement): saved only to the first *mounted* target — `HQCAM_NETWORK_DIR` (network share, preferred because it's off the device), then the USB drive (`HQCAM_RECORD_DIR`) — under `<target>/snapshots/YYYY-MM-DD/<n>.jpg`, capped at `HQCAM_SNAPSHOT_MAX_MB` (200). With no target mounted, `POST /api/snapshots` is 409 and the UI uses `POST /api/snapshots/download` instead: the JPEG goes straight back to the requesting device from memory and nothing is written. Names are validated so requests can't escape the folder.
 - **Manual record** (`POST /api/record {"on":true}`): `Recorder::set_manual` in `src/recorder/`. Always continuous, works online or offline, still USB-only (409 with no drive). The recorder thread now always runs; `HQCAM_RECORD=0` only disables the *automatic* offline mode.
 - **Orientation / focus** (`POST /api/orientation`, `/api/focus`): applied live (capture restarts, ~1s blip) and **saved to `record.conf`** by `src/conf/` (replaces active `KEY=` lines, else uncomments the documented `#KEY=` line, else appends; atomic rename). The legacy `/orientation?…` query form still works but is in-memory only.
 
@@ -65,7 +65,9 @@ Pieces (all in `_scripts/`, shipped by the deb):
 
 Manual (non-deb) install: `_scripts/install-hqcam-hotspot.sh` (run as root from `_scripts/`), mirroring `install-hqcam-service.sh`.
 
-Note: the deb's `preinst`/`postinst` clean old capture binaries with `hqcam-*-2.*` (arch×glibc), deliberately narrower than `hqcam-*` so the sibling `hqcam-hotspot` command isn't deleted on upgrade.
+Note: the deb ships ONE capture binary per arch, staged as `hqcam-<arch>` (built against the glibc 2.24 floor by `_package/_release.sh`; glibc is backward compatible). `postinst` moves it to `/usr/local/bin/hqcam`. `preinst`/`postinst` clean staged binaries by explicit name (`hqcam-arm64`, `hqcam-armhf`, legacy per-glibc `hqcam-*-2.*`) — never `hqcam-*` — so the sibling `hqcam-hotspot` / `hqcam-sync` commands aren't deleted on upgrade.
+
+Release builds run from a fresh clone (the admin CI/CD "HQ Cams" tab → sp-builder on Frasier, default branch `edge`): only `_package/hqcam/DEBIAN/` is tracked; the rest of `_package/hqcam/` is staged at build time. `_release.sh` takes `<major|minor|patch|none|X.Y.Z> <deploy> <arm64|armhf|all> <rc>`.
 
 ## USB footage recording (offline)
 

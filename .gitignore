@@ -1,4 +1,10 @@
 /target
 /_package/target
-/_package/hqcam
 /_package/deb
+# Package skeleton: only DEBIAN/ (control + maintainer scripts) is source. The rest
+# of _package/hqcam is staged at build time — copy-supporting-files.sh copies the
+# units/scripts/confs in from _scripts/ and _tooling/, and _release.sh drops the
+# compiled binaries into usr/local/bin. Tracking DEBIAN/ lets a fresh clone (the
+# sp-builder on Frasier) build the deb.
+/_package/hqcam/*
+!/_package/hqcam/DEBIAN/
